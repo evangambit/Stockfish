@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iterator>
 #include <optional>
 #include <sstream>
@@ -148,6 +149,8 @@ void UCIEngine::loop() {
             sync_cout << engine.visualize() << sync_endl;
         else if (token == "eval")
             engine.trace_eval();
+        else if (token == "analyze_file")
+            analyze_file(is);
         else if (token == "compiler")
             sync_cout << compiler_info() << sync_endl;
         else if (token == "export_net")
@@ -454,6 +457,147 @@ void UCIEngine::benchmark(std::istream& args) {
 void UCIEngine::setoption(std::istringstream& is) {
     engine.wait_for_search_finished();
     engine.get_options().setoption(is);
+}
+
+void UCIEngine::analyze_file(std::istringstream& is) {
+    std::string filepath;
+    int         searchDepth = 12;
+    int         numMoves    = 5;
+
+    // Parse arguments: analyze_file <filepath> [depth <d>] [moves <n>]
+    is >> filepath;
+    if (filepath.empty())
+    {
+        sync_cout << "info string Usage: analyze_file <filepath> [depth <d>] [moves <n>]" << sync_endl;
+        return;
+    }
+
+    std::string token;
+    while (is >> token)
+    {
+        if (token == "depth")
+            is >> searchDepth;
+        else if (token == "moves")
+            is >> numMoves;
+    }
+
+    std::ifstream infile(filepath);
+    if (!infile.is_open())
+    {
+        sync_cout << "info string Error: cannot open file '" << filepath << "'" << sync_endl;
+        return;
+    }
+
+    // Set MultiPV to the requested number of moves
+    auto mpvIs = std::istringstream("name MultiPV value " + std::to_string(numMoves));
+    setoption(mpvIs);
+
+    // Capture the multi-PV info lines during search
+    struct PVInfo {
+        size_t      multiPV;
+        std::string move;  // first move in PV
+        std::string scoreStr;
+        int         depth;
+    };
+
+    std::vector<PVInfo> pvInfos;
+    int                 lastDepth = 0;
+
+    // Silence normal output and capture multi-PV results
+    engine.set_on_update_full([&](const Engine::InfoFull& info) {
+        // Track the PV info for the deepest completed iteration
+        if (int(info.depth) > lastDepth && info.multiPV == 1)
+        {
+            // New deeper iteration started, clear previous results
+            pvInfos.clear();
+            lastDepth = info.depth;
+        }
+
+        if (int(info.depth) == lastDepth)
+        {
+            PVInfo pi;
+            pi.multiPV  = info.multiPV;
+            pi.depth    = info.depth;
+            pi.scoreStr = format_score(info.score);
+
+            // Extract first move from the PV string
+            std::string pvStr(info.pv);
+            auto        spacePos = pvStr.find(' ');
+            pi.move = (spacePos != std::string::npos) ? pvStr.substr(0, spacePos) : pvStr;
+
+            // Replace or append
+            bool found = false;
+            for (auto& existing : pvInfos)
+            {
+                if (existing.multiPV == info.multiPV)
+                {
+                    existing = pi;
+                    found    = true;
+                    break;
+                }
+            }
+            if (!found)
+                pvInfos.push_back(pi);
+        }
+    });
+    engine.set_on_iter([](const auto&) {});
+    engine.set_on_update_no_moves([](const auto&) {});
+    engine.set_on_bestmove([](const auto&, const auto&) {});
+    engine.set_on_verify_network([](const auto&) {});
+
+    std::string fen;
+    while (std::getline(infile, fen))
+    {
+        // Skip empty lines and comments
+        if (fen.empty() || fen[0] == '#')
+            continue;
+
+        // Trim whitespace
+        auto start = fen.find_first_not_of(" \t\r\n");
+        auto end   = fen.find_last_not_of(" \t\r\n");
+        if (start == std::string::npos)
+            continue;
+        fen = fen.substr(start, end - start + 1);
+
+        auto err = engine.set_position(fen, {});
+        if (err.has_value())
+        {
+            std::cout << "error: " << err->what() << std::endl;
+            continue;
+        }
+
+        Search::LimitsType limits;
+        limits.startTime = now();
+        limits.depth     = searchDepth;
+
+        pvInfos.clear();
+        lastDepth = 0;
+
+        engine.go(limits);
+        engine.wait_for_search_finished();
+
+        // Output one line: move1:score1 move2:score2 ...
+        // Sort by multiPV index
+        std::sort(pvInfos.begin(), pvInfos.end(),
+                  [](const PVInfo& a, const PVInfo& b) { return a.multiPV < b.multiPV; });
+
+        std::stringstream ss;
+        ss << fen;
+        for (size_t i = 0; i < pvInfos.size(); ++i)
+        {
+            ss << "|" << pvInfos[i].move << ":" << pvInfos[i].scoreStr;
+        }
+        std::cout << ss.str() << std::endl;
+    }
+
+    infile.close();
+
+    // Restore MultiPV to 1
+    mpvIs = std::istringstream("name MultiPV value 1");
+    setoption(mpvIs);
+
+    // Restore normal search update listeners
+    init_search_update_listeners();
 }
 
 std::uint64_t UCIEngine::perft(const Search::LimitsType& limits) {
